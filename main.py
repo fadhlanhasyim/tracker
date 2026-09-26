@@ -179,9 +179,9 @@ def get_google_sheet():
     return worksheet
 
 
-def build_sheet_row(raw_text, expense):
+def build_sheet_row(raw_text, expense, update_id):
     """
-    Convert a parsed expense into the exact Google Sheet row format.
+    Convert a parsed expense into the Google Sheet row format.
 
     Column order:
         A Timestamp
@@ -193,6 +193,7 @@ def build_sheet_row(raw_text, expense):
         G Item
         H Amount_IDR
         I Category
+        J Telegram_Update_ID
     """
 
     expense_datetime = expense["expense_datetime"]
@@ -207,17 +208,34 @@ def build_sheet_row(raw_text, expense):
         expense["item"],
         expense["amount"],
         expense["category"],
+        update_id,
     ]
 
 
-def append_expense(raw_text, expense):
+def is_update_processed(worksheet, update_id):
+    """
+    Check whether this Telegram update has already been processed.
+
+    Telegram_Update_ID is stored in column J.
+    """
+
+    update_ids = worksheet.col_values(10)
+
+    return str(update_id) in update_ids
+
+
+def append_expense(raw_text, expense, update_id):
     """
     Append one parsed expense to Google Sheets.
     """
 
     worksheet = get_google_sheet()
 
-    row = build_sheet_row(raw_text, expense)
+    row = build_sheet_row(
+        raw_text,
+        expense,
+        update_id,
+    )
 
     worksheet.append_row(
         row,
@@ -257,11 +275,20 @@ app = Flask(__name__)
 def telegram_webhook():
     """
     Receive an incoming Telegram message.
+
+    Telegram may retry the same update if the webhook request
+    fails. The update_id stored in Google Sheets prevents the
+    same expense from being recorded multiple times.
     """
 
     update = request.get_json(silent=True)
 
     if not update:
+        return {"ok": True}, 200
+
+    update_id = update.get("update_id")
+
+    if update_id is None:
         return {"ok": True}, 200
 
     message = update.get("message")
@@ -276,6 +303,38 @@ def telegram_webhook():
         return {"ok": True}, 200
 
     chat_id = chat["id"]
+
+    # --------------------------------------------------------
+    # Check for duplicate Telegram update
+    # --------------------------------------------------------
+
+    try:
+        worksheet = get_google_sheet()
+
+        if is_update_processed(worksheet, update_id):
+            app.logger.info(
+                "Ignoring duplicate Telegram update: %s",
+                update_id,
+            )
+
+            return {"ok": True}, 200
+
+    except Exception:
+        app.logger.exception(
+            "Failed to check Telegram update ID"
+        )
+
+        send_telegram_message(
+            chat_id,
+            "⚠️ Something went wrong while checking your expense. "
+            "Please try again.",
+        )
+
+        return {"ok": True}, 200
+
+    # --------------------------------------------------------
+    # Validate message
+    # --------------------------------------------------------
 
     if not raw_text:
         send_telegram_message(
@@ -292,8 +351,21 @@ def telegram_webhook():
         send_telegram_message(chat_id, error)
         return {"ok": True}, 200
 
+    # --------------------------------------------------------
+    # Save expense
+    # --------------------------------------------------------
+
     try:
-        append_expense(raw_text, expense)
+        row = build_sheet_row(
+            raw_text,
+            expense,
+            update_id,
+        )
+
+        worksheet.append_row(
+            row,
+            value_input_option="USER_ENTERED",
+        )
 
     except Exception:
         app.logger.exception(
@@ -308,12 +380,25 @@ def telegram_webhook():
 
         return {"ok": True}, 200
 
-    send_telegram_message(
-        chat_id,
-        f"✅ Added: Rp{expense['amount']:,}\n"
-        f"Category: {expense['category']}\n"
-        f"Item: {expense['item']}",
-    )
+    # --------------------------------------------------------
+    # Send confirmation
+    # --------------------------------------------------------
+
+    try:
+        send_telegram_message(
+            chat_id,
+            f"✅ Added: Rp{expense['amount']:,}\n"
+            f"Category: {expense['category']}\n"
+            f"Item: {expense['item']}",
+        )
+
+    except Exception:
+        # The expense has already been saved.
+        # Return 200 so Telegram does not retry the update
+        # and create a duplicate expense.
+        app.logger.exception(
+            "Failed to send Telegram reply"
+        )
 
     return {"ok": True}, 200
 
