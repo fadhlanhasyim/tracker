@@ -1,15 +1,14 @@
 import json
 import os
 import re
-
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import gspread
+import requests
 from dotenv import load_dotenv
 from flask import Flask, request
 from google.oauth2.service_account import Credentials
-from twilio.twiml.messaging_response import MessagingResponse
 
 
 load_dotenv()
@@ -41,6 +40,12 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+
+TELEGRAM_API_URL = (
+    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+)
+
 
 # ============================================================
 # Expense Parser
@@ -48,7 +53,7 @@ GOOGLE_SCOPES = [
 
 def parse_expense(raw_text):
     """
-    Parse a WhatsApp expense message.
+    Parse a Telegram expense message.
 
     Supported formats:
         25k makan nasi goreng
@@ -221,35 +226,71 @@ def append_expense(raw_text, expense):
 
 
 # ============================================================
-# Flask / Twilio Webhook
+# Telegram
+# ============================================================
+
+def send_telegram_message(chat_id, text):
+    """
+    Send a message to a Telegram chat.
+    """
+
+    response = requests.post(
+        f"{TELEGRAM_API_URL}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": text,
+        },
+        timeout=10,
+    )
+
+    response.raise_for_status()
+
+
+# ============================================================
+# Flask
 # ============================================================
 
 app = Flask(__name__)
 
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
     """
-    Receive an incoming WhatsApp message from Twilio.
+    Receive an incoming Telegram message.
     """
 
-    raw_text = request.form.get("Body", "").strip()
+    update = request.get_json(silent=True)
 
-    response = MessagingResponse()
+    if not update:
+        return {"ok": True}, 200
+
+    message = update.get("message")
+
+    if not message:
+        return {"ok": True}, 200
+
+    chat = message.get("chat")
+    raw_text = message.get("text", "").strip()
+
+    if not chat:
+        return {"ok": True}, 200
+
+    chat_id = chat["id"]
 
     if not raw_text:
-        response.message(
-            "⚠️ Empty message. Use: <amount> <category> <description>\n"
-            "Example: 25k makan nasi goreng"
+        send_telegram_message(
+            chat_id,
+            "⚠️ Please send an expense message.\n"
+            "Example: 25k makan nasi goreng",
         )
 
-        return str(response)
+        return {"ok": True}, 200
 
     expense, error = parse_expense(raw_text)
 
     if error:
-        response.message(error)
-        return str(response)
+        send_telegram_message(chat_id, error)
+        return {"ok": True}, 200
 
     try:
         append_expense(raw_text, expense)
@@ -259,20 +300,22 @@ def webhook():
             "Failed to append expense to Google Sheets"
         )
 
-        response.message(
+        send_telegram_message(
+            chat_id,
             "⚠️ Something went wrong while saving your expense. "
-            "Please try again."
+            "Please try again.",
         )
 
-        return str(response), 500
+        return {"ok": True}, 200
 
-    response.message(
+    send_telegram_message(
+        chat_id,
         f"✅ Added: Rp{expense['amount']:,}\n"
         f"Category: {expense['category']}\n"
-        f"Item: {expense['item']}"
+        f"Item: {expense['item']}",
     )
 
-    return str(response)
+    return {"ok": True}, 200
 
 
 # ============================================================

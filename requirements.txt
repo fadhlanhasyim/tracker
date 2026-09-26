@@ -1,6 +1,6 @@
 flask
 gspread
 google-auth
-twilio
 gunicorn
 python-dotenv
+requests
