@@ -1,5 +1,7 @@
+import json
 import os
 import re
+
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -141,14 +143,28 @@ def parse_expense(raw_text):
 def get_google_sheet():
     """
     Authenticate with Google and return Sheet1.
+
+    Local:
+        Uses credentials.json
+
+    Production:
+        Uses GOOGLE_CREDENTIALS_JSON environment variable
     """
 
     spreadsheet_id = os.environ["SPREADSHEET_ID"]
 
-    credentials = Credentials.from_service_account_file(
-        "credentials.json",
-        scopes=GOOGLE_SCOPES,
-    )
+    credentials_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+
+    if credentials_json:
+        credentials = Credentials.from_service_account_info(
+            json.loads(credentials_json),
+            scopes=GOOGLE_SCOPES,
+        )
+    else:
+        credentials = Credentials.from_service_account_file(
+            "credentials.json",
+            scopes=GOOGLE_SCOPES,
+        )
 
     client = gspread.authorize(credentials)
 
