@@ -305,6 +305,40 @@ def telegram_webhook():
     chat_id = chat["id"]
 
     # --------------------------------------------------------
+    # Help command
+    # --------------------------------------------------------
+
+    if raw_text.lower() == "/help":
+        send_telegram_message(
+            chat_id,
+            "💰 Expense Tracker\n\n"
+            "Format:\n"
+            "<amount> <category> <description>\n\n"
+            "Example:\n"
+            "25k makan nasi goreng\n\n"
+            "Categories:\n"
+            "• makan\n"
+            "• transportasi\n"
+            "• tagihan\n"
+            "• keluarga\n"
+            "• donasi\n"
+            "• personal\n"
+            "• lainnya\n\n"
+            "Units:\n"
+            "• k\n"
+            "• rb\n"
+            "• ribu\n\n"
+            "Optional date/time:\n"
+            "@YYYY-MM-DD\n"
+            "@YYYY-MM-DD HH:MM\n\n"
+            "Example:\n"
+            "32k makan Kopi Spanish Latte "
+            "@2026-09-25 13:00"
+        )
+
+        return {"ok": True}, 200
+
+    # --------------------------------------------------------
     # Check for duplicate Telegram update
     # --------------------------------------------------------
 
