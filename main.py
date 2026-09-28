@@ -1,7 +1,7 @@
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -35,6 +35,11 @@ EXPENSE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+STATS_PATTERN = re.compile(
+    r"^/stats(?:\s+(\d{4}-\d{2}-\d{2}))?(?:\s+(\d{4}-\d{2}-\d{2}))?$",
+    re.IGNORECASE,
+)
+
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -64,10 +69,6 @@ def parse_expense(raw_text):
         25k makan nasi goreng @2026-09-25 19:30
 
     If no date/time is provided, the current Jakarta time is used.
-
-    Returns:
-        (expense_dict, None) on success
-        (None, error_message) on failure
     """
 
     match = EXPENSE_PATTERN.match(raw_text.strip())
@@ -108,7 +109,6 @@ def parse_expense(raw_text):
                     f"{date_str} {time_str}",
                     "%Y-%m-%d %H:%M",
                 ).replace(tzinfo=JAKARTA_TZ)
-
             else:
                 expense_datetime = datetime.strptime(
                     date_str,
@@ -153,7 +153,7 @@ def get_google_sheet():
         Uses credentials.json
 
     Production:
-        Uses GOOGLE_CREDENTIALS_JSON environment variable
+        Uses GOOGLE_CREDENTIALS_JSON environment variable.
     """
 
     spreadsheet_id = os.environ["SPREADSHEET_ID"]
@@ -181,19 +181,18 @@ def get_google_sheet():
 
 def build_sheet_row(raw_text, expense, update_id):
     """
-    Convert a parsed expense into the Google Sheet row format.
-
     Column order:
-        A Timestamp
-        B Day
-        C Month
-        D Year
-        E Day_of_Week
-        F Raw_Text
-        G Item
-        H Amount_IDR
-        I Category
-        J Telegram_Update_ID
+
+    A Timestamp
+    B Day
+    C Month
+    D Year
+    E Day_of_Week
+    F Raw_Text
+    G Item
+    H Amount_IDR
+    I Category
+    J Telegram_Update_ID
     """
 
     expense_datetime = expense["expense_datetime"]
@@ -244,6 +243,248 @@ def append_expense(raw_text, expense, update_id):
 
 
 # ============================================================
+# Statistics
+# ============================================================
+
+def get_stats_date_range(start_date_str=None, end_date_str=None):
+    """
+    Determine the requested stats date range.
+
+    /stats
+        Last 30 days, including today.
+
+    /stats YYYY-MM-DD
+        That single date.
+
+    /stats YYYY-MM-DD YYYY-MM-DD
+        Inclusive date range.
+    """
+
+    today = datetime.now(JAKARTA_TZ).date()
+
+    if not start_date_str and not end_date_str:
+        end_date = today
+        start_date = today - timedelta(days=29)
+
+        return start_date, end_date, None
+
+    try:
+        if start_date_str and not end_date_str:
+            start_date = datetime.strptime(
+                start_date_str,
+                "%Y-%m-%d",
+            ).date()
+
+            end_date = start_date
+
+        elif start_date_str and end_date_str:
+            start_date = datetime.strptime(
+                start_date_str,
+                "%Y-%m-%d",
+            ).date()
+
+            end_date = datetime.strptime(
+                end_date_str,
+                "%Y-%m-%d",
+            ).date()
+
+        else:
+            return None, None, (
+                "⚠️ Invalid stats format.\n\n"
+                "Use:\n"
+                "/stats\n"
+                "/stats YYYY-MM-DD\n"
+                "/stats YYYY-MM-DD YYYY-MM-DD"
+            )
+
+    except ValueError:
+        return None, None, (
+            "⚠️ Invalid date. Use YYYY-MM-DD.\n"
+            "Example: /stats 2026-09-01 2026-09-28"
+        )
+
+    if start_date > end_date:
+        return None, None, (
+            "⚠️ Start date cannot be after end date."
+        )
+
+    return start_date, end_date, None
+
+
+def calculate_stats(worksheet, start_date, end_date):
+    """
+    Calculate expense statistics from Sheet1.
+
+    Uses the Timestamp column as the expense datetime.
+    """
+
+    rows = worksheet.get_all_values()
+
+    if len(rows) <= 1:
+        return {
+            "total": 0,
+            "transactions": 0,
+            "categories": {
+                category: {
+                    "amount": 0,
+                    "transactions": 0,
+                }
+                for category in sorted(ALLOWED_CATEGORIES)
+            },
+        }
+
+    stats = {
+        "total": 0,
+        "transactions": 0,
+        "categories": {
+            category: {
+                "amount": 0,
+                "transactions": 0,
+            }
+            for category in sorted(ALLOWED_CATEGORIES)
+        },
+    }
+
+    for row in rows[1:]:
+        if len(row) < 9:
+            continue
+
+        timestamp = row[0]
+        category = row[8].strip().lower()
+
+        if not timestamp or category not in ALLOWED_CATEGORIES:
+            continue
+
+        try:
+            expense_datetime = datetime.strptime(
+                timestamp,
+                "%Y-%m-%d %H:%M:%S",
+            )
+
+            expense_date = expense_datetime.date()
+
+        except ValueError:
+            continue
+
+        if not (start_date <= expense_date <= end_date):
+            continue
+
+        try:
+            amount = int(float(row[7]))
+        except (ValueError, TypeError):
+            continue
+
+        stats["total"] += amount
+        stats["transactions"] += 1
+
+        stats["categories"][category]["amount"] += amount
+        stats["categories"][category]["transactions"] += 1
+
+    return stats
+
+
+def format_rupiah(amount):
+    """
+    Format an integer as Indonesian Rupiah.
+    """
+
+    return f"Rp{amount:,}"
+
+
+def format_stats_message(start_date, end_date, stats):
+    """
+    Create the Telegram response for /stats.
+    """
+
+    if start_date == end_date:
+        date_range = start_date.strftime("%Y-%m-%d")
+    else:
+        date_range = (
+            f"{start_date.strftime('%Y-%m-%d')} → "
+            f"{end_date.strftime('%Y-%m-%d')}"
+        )
+
+    total = stats["total"]
+    transactions = stats["transactions"]
+
+    lines = [
+        "📊 Expense Stats",
+        date_range,
+        "",
+        f"Total: {format_rupiah(total)}",
+        f"Transactions: {transactions}",
+    ]
+
+    if transactions > 0:
+        average = total / transactions
+
+        lines.append(
+            f"Average: {format_rupiah(round(average))}"
+        )
+
+    lines.append("")
+
+    for category in sorted(ALLOWED_CATEGORIES):
+        category_stats = stats["categories"][category]
+
+        amount = category_stats["amount"]
+        category_transactions = category_stats["transactions"]
+
+        if total > 0:
+            percentage = amount / total * 100
+        else:
+            percentage = 0
+
+        lines.append(
+            f"{category}: "
+            f"{format_rupiah(amount)} · "
+            f"{percentage:.1f}% · "
+            f"{category_transactions} transactions"
+        )
+
+    return "\n".join(lines)
+
+
+def handle_stats_command(worksheet, raw_text):
+    """
+    Parse and execute /stats.
+    """
+
+    match = STATS_PATTERN.match(raw_text.strip())
+
+    if not match:
+        return (
+            "⚠️ Invalid stats format.\n\n"
+            "Use:\n"
+            "/stats\n"
+            "/stats YYYY-MM-DD\n"
+            "/stats YYYY-MM-DD YYYY-MM-DD"
+        )
+
+    start_date_str, end_date_str = match.groups()
+
+    start_date, end_date, error = get_stats_date_range(
+        start_date_str,
+        end_date_str,
+    )
+
+    if error:
+        return error
+
+    stats = calculate_stats(
+        worksheet,
+        start_date,
+        end_date,
+    )
+
+    return format_stats_message(
+        start_date,
+        end_date,
+        stats,
+    )
+
+
+# ============================================================
 # Telegram
 # ============================================================
 
@@ -275,10 +516,6 @@ app = Flask(__name__)
 def telegram_webhook():
     """
     Receive an incoming Telegram message.
-
-    Telegram may retry the same update if the webhook request
-    fails. The update_id stored in Google Sheets prevents the
-    same expense from being recorded multiple times.
     """
 
     update = request.get_json(silent=True)
@@ -312,7 +549,12 @@ def telegram_webhook():
         send_telegram_message(
             chat_id,
             "💰 Expense Tracker\n\n"
-            "Format:\n"
+            "Commands:\n"
+            "/help - Show this help\n"
+            "/stats - Stats for the last 30 days\n"
+            "/stats YYYY-MM-DD - Stats for one day\n"
+            "/stats YYYY-MM-DD YYYY-MM-DD - Stats for a date range\n\n"
+            "Expense format:\n"
             "<amount> <category> <description>\n\n"
             "Example:\n"
             "25k makan nasi goreng\n\n"
@@ -339,13 +581,63 @@ def telegram_webhook():
         return {"ok": True}, 200
 
     # --------------------------------------------------------
-    # Check for duplicate Telegram update
+    # Get worksheet
     # --------------------------------------------------------
 
     try:
         worksheet = get_google_sheet()
 
-        if is_update_processed(worksheet, update_id):
+    except Exception:
+        app.logger.exception(
+            "Failed to connect to Google Sheets"
+        )
+
+        send_telegram_message(
+            chat_id,
+            "⚠️ Something went wrong while connecting "
+            "to Google Sheets. Please try again.",
+        )
+
+        return {"ok": True}, 200
+
+    # --------------------------------------------------------
+    # Stats command
+    # --------------------------------------------------------
+
+    if raw_text.lower().startswith("/stats"):
+        try:
+            response = handle_stats_command(
+                worksheet,
+                raw_text,
+            )
+
+            send_telegram_message(
+                chat_id,
+                response,
+            )
+
+        except Exception:
+            app.logger.exception(
+                "Failed to calculate expense statistics"
+            )
+
+            send_telegram_message(
+                chat_id,
+                "⚠️ Something went wrong while calculating "
+                "your expense stats.",
+            )
+
+        return {"ok": True}, 200
+
+    # --------------------------------------------------------
+    # Check for duplicate Telegram update
+    # --------------------------------------------------------
+
+    try:
+        if is_update_processed(
+            worksheet,
+            update_id,
+        ):
             app.logger.info(
                 "Ignoring duplicate Telegram update: %s",
                 update_id,
@@ -360,8 +652,8 @@ def telegram_webhook():
 
         send_telegram_message(
             chat_id,
-            "⚠️ Something went wrong while checking your expense. "
-            "Please try again.",
+            "⚠️ Something went wrong while checking "
+            "your expense. Please try again.",
         )
 
         return {"ok": True}, 200
@@ -382,7 +674,11 @@ def telegram_webhook():
     expense, error = parse_expense(raw_text)
 
     if error:
-        send_telegram_message(chat_id, error)
+        send_telegram_message(
+            chat_id,
+            error,
+        )
+
         return {"ok": True}, 200
 
     # --------------------------------------------------------
@@ -408,8 +704,8 @@ def telegram_webhook():
 
         send_telegram_message(
             chat_id,
-            "⚠️ Something went wrong while saving your expense. "
-            "Please try again.",
+            "⚠️ Something went wrong while saving "
+            "your expense. Please try again.",
         )
 
         return {"ok": True}, 200
